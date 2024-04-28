@@ -1,4 +1,4 @@
-# Youtube Downloader
+# Video Downloader
 
 This is a simple GUI application built with Tkinter in Python for downloading YouTube videos.
 
