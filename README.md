@@ -13,7 +13,7 @@ This is a simple GUI application built with Tkinter in Python for downloading Yo
 ## Requirements
 
 - Python 3.x
-- pytube library
-- customtkinter library
+- pytube library ("pip3 install pytube")
+- customtkinter library ("pip3 install customtkinter")
 
 You can install the required libraries using pip
