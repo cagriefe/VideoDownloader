@@ -1,0 +1,4 @@
+-r requirements.txt
+faster-whisper>=1.1.0
+# faster-whisper 1.2.1 doesn't work with PyAV 19 yet (only matters when ffmpeg isn't installed).
+av<19

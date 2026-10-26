@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+
+# Media saved into the project folder by older versions of the app
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.part

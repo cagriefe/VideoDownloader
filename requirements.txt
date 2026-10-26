@@ -1,0 +1,4 @@
+customtkinter>=5.2.2
+# "default" adds the YouTube challenge solver scripts, "curl-cffi" browser
+# impersonation (needed for some requests), "deno" the JavaScript runtime.
+yt-dlp[default,curl-cffi,deno]>=2026.10.21
