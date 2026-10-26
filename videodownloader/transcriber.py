@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -28,6 +29,34 @@ from typing import Callable
 SUBTITLE_FORMATS = ("json3", "vtt", "srt")
 
 SENTENCE_ENDINGS = (".", "!", "?", "…", "。", "！", "？")
+
+# Languages offered for transcripts and summaries (YouTube's language codes).
+LANGUAGES = {
+    "en": "English", "tr": "Turkish", "de": "German", "fr": "French", "es": "Spanish",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "pl": "Polish", "sv": "Swedish",
+    "ru": "Russian", "uk": "Ukrainian", "el": "Greek", "ar": "Arabic", "fa": "Persian",
+    "hi": "Hindi", "id": "Indonesian", "ja": "Japanese", "ko": "Korean", "zh-Hans": "Chinese",
+}
+
+# ISO 639-2 codes, used to tag embedded subtitle tracks.
+ISO_639_2 = {
+    "en": "eng", "tr": "tur", "de": "ger", "fr": "fre", "es": "spa", "it": "ita", "pt": "por",
+    "nl": "dut", "pl": "pol", "sv": "swe", "ru": "rus", "uk": "ukr", "el": "gre", "ar": "ara",
+    "fa": "per", "hi": "hin", "id": "ind", "ja": "jpn", "ko": "kor", "zh": "chi",
+}
+
+# Subtitle codecs for the containers the app produces.
+SUBTITLE_CODECS = {".mp4": "mov_text", ".m4v": "mov_text", ".mov": "mov_text", ".mkv": "srt", ".webm": "webvtt"}
+
+
+def base_language(code: str | None) -> str:
+    return (code or "").split("-")[0].lower()
+
+
+def language_name(code: str | None) -> str:
+    if not code:
+        return "the original language"
+    return LANGUAGES.get(code) or LANGUAGES.get(base_language(code)) or code
 
 
 @dataclass
@@ -63,16 +92,31 @@ def _match_language(tracks: dict, code: str | None) -> str | None:
     return None
 
 
-def pick_subtitle_track(info: dict) -> tuple[str, list, bool] | None:
-    """Choose the subtitle track that best represents what is said in the video.
+def pick_subtitle_track(info: dict, language: str | None = None) -> tuple[str, list, bool] | None:
+    """Choose the subtitle track to build a transcript from.
 
-    Returns ``(language, formats, is_automatic)`` or ``None``. Preference order:
+    Returns ``(language, formats, is_automatic)`` or ``None``.
+
+    Without `language`, the track should match what is said in the video:
     uploaded subtitles in the spoken language, automatic captions in the
     original language, then any uploaded subtitles (English first).
+
+    With `language`, uploaded subtitles in that language are preferred, then
+    YouTube's machine-translated captions. ``None`` means there are none.
     """
     manual = {k: v for k, v in (info.get("subtitles") or {}).items() if v and k != "live_chat"}
     automatic = {k: v for k, v in (info.get("automatic_captions") or {}).items() if v}
     spoken = info.get("language")
+
+    if language and base_language(language) != base_language(spoken):
+        key = _match_language(manual, language)
+        if key:
+            return key, manual[key], False
+        translated = {k: v for k, v in automatic.items() if not k.endswith("-orig")}
+        key = _match_language(translated, language) or _match_language(automatic, language)
+        if key:
+            return key, automatic[key], True
+        return None
 
     key = _match_language(manual, spoken)
     if key:
@@ -193,12 +237,12 @@ def parse_subtitles(text: str, ext: str) -> list[Segment]:
     return parse_timed_text(text)
 
 
-def fetch_subtitles(ydl, info: dict, workdir: str) -> Transcript | None:
-    """Download and parse the best subtitle track of a video, if it has one."""
-    track = pick_subtitle_track(info)
+def fetch_subtitles(ydl, info: dict, workdir: str, language: str | None = None) -> Transcript | None:
+    """Download and parse the best subtitle track of a video, if it has one (see `pick_subtitle_track`)."""
+    track = pick_subtitle_track(info, language)
     if not track:
         return None
-    language, formats, automatic = track
+    key, formats, automatic = track
     fmt = choose_subtitle_format(formats)
     if not fmt:
         return None
@@ -206,10 +250,10 @@ def fetch_subtitles(ydl, info: dict, workdir: str) -> Transcript | None:
     if fmt.get("data") is not None:
         text = fmt["data"]
     else:
-        path = os.path.join(workdir, f"{info.get('id', 'video')}.{language}.{fmt['ext']}")
+        path = os.path.join(workdir, f"{info.get('id', 'video')}.{key}.{fmt['ext']}")
         request = dict(fmt)
         request.setdefault("http_headers", info.get("http_headers"))
-        ydl.dl(path, request, subtitle=True)
+        _download_with_retries(ydl, path, request)
         if not os.path.exists(path):
             return None
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -218,9 +262,42 @@ def fetch_subtitles(ydl, info: dict, workdir: str) -> Transcript | None:
     segments = parse_subtitles(text, fmt["ext"])
     if not segments:
         return None
-    kind = "automatic captions" if automatic else "uploaded subtitles"
-    name = fmt.get("name") or language
-    return Transcript(segments, f"{kind} ({name})", language.split("-")[0])
+    if "tlang=" in (fmt.get("url") or ""):
+        kind = "automatic captions, translated by YouTube"
+    else:
+        kind = "automatic captions" if automatic else "uploaded subtitles"
+    code = key[:-len("-orig")] if key.endswith("-orig") else key
+    return Transcript(segments, f"{kind} ({fmt.get('name') or language_name(code)})", code)
+
+
+def _download_with_retries(ydl, path: str, request: dict, waits: tuple = (3, 8)) -> None:
+    """YouTube often answers "429 Too Many Requests" for translated captions; waiting usually helps."""
+    for wait in (*waits, None):
+        try:
+            ydl.dl(path, request, subtitle=True)
+            return
+        except Exception as exc:
+            if wait is None or "429" not in str(exc):
+                raise
+            time.sleep(wait)
+
+
+def clip_segments(segments: list[Segment], start: float, end: float | None, shift: bool) -> list[Segment]:
+    """Keep the parts of segments between `start` and `end` (seconds).
+
+    With `shift`, times are moved so `start` becomes 0, matching a clipped media file.
+    """
+    end = float("inf") if end is None else end
+    offset = start if shift else 0.0
+    return [
+        Segment(max(s.start, start) - offset, min(s.end, end) - offset, s.text)
+        for s in segments
+        if s.end > start and s.start < end
+    ]
+
+
+def shift_segments(segments: list[Segment], offset: float) -> list[Segment]:
+    return [Segment(s.start + offset, s.end + offset, s.text) for s in segments]
 
 
 # --------------------------------------------------------------------------
@@ -273,11 +350,16 @@ def transcribe_audio(
     path: str,
     model_name: str,
     ffmpeg: str | None = None,
+    translate: bool = False,
     on_progress: Callable[[float, float, float], None] | None = None,
     check_cancel: Callable[[], None] | None = None,
 ) -> Transcript:
-    """Transcribe an audio or video file. `check_cancel` may raise to stop early."""
-    pieces, info = model.transcribe(load_audio(path, ffmpeg), vad_filter=True)
+    """Transcribe an audio or video file; with `translate`, into English.
+
+    `check_cancel` may raise to stop early.
+    """
+    task = "translate" if translate else "transcribe"
+    pieces, info = model.transcribe(load_audio(path, ffmpeg), vad_filter=True, task=task)
     duration = info.duration or 0.0
     segments: list[Segment] = []
     for piece in pieces:
@@ -288,8 +370,31 @@ def transcribe_audio(
             segments.append(Segment(piece.start, piece.end, text))
         if on_progress and duration > 0:
             on_progress(min(piece.end / duration, 1.0), piece.end, duration)
-    source = f"Whisper speech recognition ({model_name} model, language: {info.language})"
-    return Transcript(segments, source, info.language)
+    spoken = language_name(info.language)
+    if translate and base_language(info.language) != "en":
+        return Transcript(segments, f"Whisper speech recognition ({model_name} model), translated from {spoken}", "en")
+    return Transcript(segments, f"Whisper speech recognition ({model_name} model, language: {spoken})", info.language)
+
+
+def can_embed_subtitles(media_path: str) -> bool:
+    return os.path.splitext(media_path)[1].lower() in SUBTITLE_CODECS
+
+
+def embed_subtitles(ffmpeg: str, media_path: str, srt_path: str, language: str | None = None) -> None:
+    """Add an .srt file to a video as a subtitle track that players can switch on (no re-encoding)."""
+    ext = os.path.splitext(media_path)[1].lower()
+    temp_path = os.path.splitext(media_path)[0] + ".subtitled" + ext
+    command = [
+        ffmpeg, "-nostdin", "-v", "error", "-y", "-i", media_path, "-i", srt_path,
+        "-map", "0", "-map", "-0:s", "-map", "1:0", "-c", "copy", "-c:s", SUBTITLE_CODECS[ext],
+        "-metadata:s:s:0", f"language={ISO_639_2.get(base_language(language), 'und')}", temp_path,
+    ]
+    result = subprocess.run(command, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode != 0:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or "ffmpeg couldn't add the subtitles")
+    os.replace(temp_path, media_path)
 
 
 # --------------------------------------------------------------------------

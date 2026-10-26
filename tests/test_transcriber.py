@@ -1,10 +1,12 @@
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 
-import transcriber
-from transcriber import Segment, Transcript
+from videodownloader import transcriber
+from videodownloader.transcriber import Segment, Transcript
 
 # Trimmed copy of a real YouTube auto-caption file: every cue repeats the
 # previous line, and whitespace-only lines belong to the cue.
@@ -110,6 +112,33 @@ class TrackSelectionTests(unittest.TestCase):
         self.assertIsNone(transcriber.choose_subtitle_format([{"ext": "ttml"}]))
 
 
+class TranslationTests(unittest.TestCase):
+    INFO = {"language": "en", "subtitles": {"en": FMT, "de": FMT},
+            "automatic_captions": {"en-orig": FMT, "en": FMT, "tr": FMT, "zh-Hans": FMT}}
+
+    def test_uploaded_subtitles_in_the_requested_language_win(self):
+        self.assertEqual(transcriber.pick_subtitle_track(self.INFO, "de")[:1], ("de",))
+        self.assertFalse(transcriber.pick_subtitle_track(self.INFO, "de")[2])
+
+    def test_machine_translated_captions(self):
+        language, _, automatic = transcriber.pick_subtitle_track(self.INFO, "tr")
+        self.assertEqual((language, automatic), ("tr", True))
+        self.assertEqual(transcriber.pick_subtitle_track(self.INFO, "zh-Hans")[0], "zh-Hans")
+
+    def test_spoken_language_uses_the_original_track(self):
+        self.assertEqual(transcriber.pick_subtitle_track(self.INFO, "en")[0], "en")
+
+    def test_unavailable_language(self):
+        self.assertIsNone(transcriber.pick_subtitle_track(self.INFO, "ja"))
+
+    def test_language_helpers(self):
+        self.assertEqual(transcriber.language_name("tr"), "Turkish")
+        self.assertEqual(transcriber.language_name("pt-BR"), "Portuguese")
+        self.assertEqual(transcriber.language_name("xx"), "xx")
+        self.assertEqual(transcriber.language_name(""), "the original language")
+        self.assertEqual(transcriber.base_language("zh-Hans"), "zh")
+
+
 class FetchSubtitlesTests(unittest.TestCase):
     def test_inline_subtitle_data_needs_no_download(self):
         info = {"id": "abc", "subtitles": {"en": [{"ext": "vtt", "data": YOUTUBE_AUTO_VTT}]}}
@@ -117,6 +146,131 @@ class FetchSubtitlesTests(unittest.TestCase):
         self.assertEqual(len(transcript.segments), 3)
         self.assertEqual(transcript.language, "en")
         self.assertIn("uploaded subtitles", transcript.source)
+
+    def test_translated_captions_are_labelled(self):
+        track = [{"ext": "vtt", "data": YOUTUBE_AUTO_VTT, "url": "https://youtube.com/api/timedtext?tlang=tr",
+                  "name": "Turkish"}]
+        info = {"id": "abc", "language": "en", "automatic_captions": {"en-orig": FMT, "tr": track}}
+        transcript = transcriber.fetch_subtitles(None, info, tempfile.gettempdir(), language="tr")
+        self.assertEqual(transcript.language, "tr")
+        self.assertEqual(transcript.source, "automatic captions, translated by YouTube (Turkish)")
+
+    def test_rate_limited_downloads_are_retried(self):
+        attempts = []
+
+        class FlakyYdl:
+            def dl(self, path, request, subtitle):
+                attempts.append(path)
+                if len(attempts) < 3:
+                    raise OSError("HTTP Error 429: Too Many Requests")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(YOUTUBE_AUTO_VTT)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "subs.vtt")
+            transcriber._download_with_retries(FlakyYdl(), path, {}, waits=(0, 0))
+            self.assertEqual(len(attempts), 3)
+            attempts.clear()
+            with self.assertRaises(OSError):
+                transcriber._download_with_retries(FlakyYdl(), path, {}, waits=(0,))
+
+        class BrokenYdl:
+            def dl(self, path, request, subtitle):
+                attempts.append(path)
+                raise OSError("HTTP Error 404: Not Found")
+
+        attempts.clear()
+        with self.assertRaises(OSError):
+            transcriber._download_with_retries(BrokenYdl(), "x", {}, waits=(0, 0))
+        self.assertEqual(len(attempts), 1)
+
+    def test_original_track_name_drops_the_orig_suffix(self):
+        info = {"id": "abc", "language": "en", "automatic_captions": {"en-orig": [{"ext": "vtt", "data": YOUTUBE_AUTO_VTT}]}}
+        transcript = transcriber.fetch_subtitles(None, info, tempfile.gettempdir())
+        self.assertEqual((transcript.language, transcript.source), ("en", "automatic captions (English)"))
+
+
+class ClipTests(unittest.TestCase):
+    SEGMENTS = [Segment(0, 10, "a"), Segment(10, 20, "b"), Segment(20, 30, "c"), Segment(30, 40, "d")]
+
+    def test_clip_keeps_overlapping_parts(self):
+        clipped = transcriber.clip_segments(self.SEGMENTS, 15, 25, shift=False)
+        self.assertEqual([(s.start, s.end, s.text) for s in clipped], [(15, 20, "b"), (20, 25, "c")])
+
+    def test_clip_can_align_with_a_clipped_file(self):
+        clipped = transcriber.clip_segments(self.SEGMENTS, 15, None, shift=True)
+        self.assertEqual([(s.start, s.end, s.text) for s in clipped], [(0, 5, "b"), (5, 15, "c"), (15, 25, "d")])
+
+    def test_shift(self):
+        shifted = transcriber.shift_segments([Segment(0, 2, "x")], 90)
+        self.assertEqual((shifted[0].start, shifted[0].end), (90, 92))
+
+
+class WhisperSourceTests(unittest.TestCase):
+    class FakeModel:
+        def __init__(self, language):
+            self.language, self.calls = language, []
+
+        def transcribe(self, audio, **options):
+            self.calls.append(options)
+            piece = type("Piece", (), {"start": 0.0, "end": 2.0, "text": " Hello. "})
+            info = type("Info", (), {"duration": 2.0, "language": self.language})
+            return iter([piece]), info
+
+    def test_transcription(self):
+        model = self.FakeModel("tr")
+        transcript = transcriber.transcribe_audio(model, "audio.mp3", "small")
+        self.assertEqual(model.calls[0]["task"], "transcribe")
+        self.assertEqual((transcript.language, transcript.segments[0].text), ("tr", "Hello."))
+        self.assertEqual(transcript.source, "Whisper speech recognition (small model, language: Turkish)")
+
+    def test_translation_into_english(self):
+        model = self.FakeModel("tr")
+        transcript = transcriber.transcribe_audio(model, "audio.mp3", "small", translate=True)
+        self.assertEqual(model.calls[0]["task"], "translate")
+        self.assertEqual(transcript.language, "en")
+        self.assertIn("translated from Turkish", transcript.source)
+
+    def test_progress_and_cancel(self):
+        progress = []
+        transcriber.transcribe_audio(self.FakeModel("en"), "a.mp3", "tiny",
+                                     on_progress=lambda *args: progress.append(args))
+        self.assertEqual(progress, [(1.0, 2.0, 2.0)])
+
+        def cancel():
+            raise RuntimeError("stop")
+
+        with self.assertRaises(RuntimeError):
+            transcriber.transcribe_audio(self.FakeModel("en"), "a.mp3", "tiny", check_cancel=cancel)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is not installed")
+class EmbedSubtitlesTests(unittest.TestCase):
+    def test_subtitles_become_a_track_in_the_video(self):
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as folder:
+            video = os.path.join(folder, "clip.mp4")
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=2",
+                            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "2", "-c:v", "libx264",
+                            "-c:a", "aac", "-shortest", video], check=True)
+            srt = os.path.join(folder, "clip.srt")
+            with open(srt, "w", encoding="utf-8") as fh:
+                fh.write(transcriber.to_srt([Segment(0, 1.5, "Merhaba dünya")]))
+            self.assertTrue(transcriber.can_embed_subtitles(video))
+            self.assertFalse(transcriber.can_embed_subtitles(os.path.join(folder, "song.mp3")))
+            transcriber.embed_subtitles(ffmpeg, video, srt, "tr")
+            probe = subprocess.run([ffmpeg, "-hide_banner", "-i", video], capture_output=True, text=True).stderr
+            self.assertRegex(probe, r"Stream #0:\d+(\[\w+\])?\(tur\): Subtitle: mov_text")
+            self.assertEqual(sorted(os.listdir(folder)), ["clip.mp4", "clip.srt"])
+
+    def test_failure_leaves_the_video_untouched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            video = os.path.join(folder, "broken.mp4")
+            with open(video, "wb") as fh:
+                fh.write(b"not a video")
+            with self.assertRaises(RuntimeError):
+                transcriber.embed_subtitles(shutil.which("ffmpeg"), video, video, "en")
+            self.assertEqual(os.listdir(folder), ["broken.mp4"])
 
 
 class OutputTests(unittest.TestCase):

@@ -1,9 +1,10 @@
 import json
 import os
+import stat
 import tempfile
 import unittest
 
-from settings import Settings, default_download_dir
+from videodownloader.settings import Settings, default_download_dir
 
 
 class SettingsTests(unittest.TestCase):
@@ -23,23 +24,30 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(Settings.load(self.path), Settings())
 
     def test_round_trip(self):
-        settings = Settings(download_dir=self.folder.name, quality="720", transcript="auto",
-                            whisper_model="base", playlist=True)
+        settings = Settings(download_dir=self.folder.name, quality="720", transcript="auto", language="tr",
+                            whisper_model="base", playlist=True, summary=True, cookies_browser="firefox",
+                            ai_provider="anthropic", ai_api_key="secret")
         settings.save(self.path)
         self.assertEqual(Settings.load(self.path), settings)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_file_is_private_because_it_may_hold_an_api_key(self):
+        Settings(ai_api_key="secret").save(self.path)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+
     def test_invalid_values_are_ignored(self):
-        self.write(json.dumps({"quality": 720, "playlist": "yes", "transcript": "auto",
+        self.write(json.dumps({"quality": 720, "playlist": "yes", "transcript": "auto", "notify": 0,
                                "download_dir": "/this/folder/does/not/exist"}))
         settings = Settings.load(self.path)
         self.assertEqual(settings.quality, "best")
         self.assertFalse(settings.playlist)
+        self.assertTrue(settings.notify)
         self.assertEqual(settings.transcript, "auto")
         self.assertEqual(settings.download_dir, default_download_dir())
 
     def test_corrupt_file_gives_defaults(self):
         self.write("{not json")
-        with self.assertLogs("settings", level="WARNING"):
+        with self.assertLogs("videodownloader.settings", level="WARNING"):
             self.assertEqual(Settings.load(self.path), Settings())
 
 
