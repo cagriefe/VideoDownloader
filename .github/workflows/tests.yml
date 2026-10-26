@@ -8,6 +8,7 @@ jobs:
   test:
     name: ${{ matrix.os }} · Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -23,8 +24,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # Optional: the subtitle-embedding test is skipped without ffmpeg, so a slow mirror mustn't block the run.
       - name: Install ffmpeg
         if: runner.os == 'Linux'
+        timeout-minutes: 4
+        continue-on-error: true
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install dependencies
         run: |
